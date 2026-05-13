@@ -1,5 +1,6 @@
 import * as core from '@actions/core'
 import * as github from '@actions/github'
+import * as fs from 'fs'
 import { App, BlockAction, LogLevel } from '@slack/bolt'
 import { WebClient } from '@slack/web-api'
 import { KnownBlock, Block } from '@slack/types'
@@ -33,10 +34,32 @@ async function run(): Promise<void> {
     const actor      = process.env.GITHUB_ACTOR || "";
     const repository = process.env.GITHUB_REPOSITORY || "";
     const ref        = process.env.GITHUB_REF || "";
+    const eventPath  = process.env.GITHUB_EVENT_PATH || "";
 
     const prMatch = ref.match(/^refs\/pull\/(\d+)\/(merge|head)$/);
-    const prNumber = prMatch ? Number(prMatch[1]) : undefined;
+    let prNumber = prMatch ? Number(prMatch[1]) : undefined;
     const [owner, repo] = repository.split("/");
+    let prHtmlUrl = prNumber ? `${github_server_url}/${github_repos}/pull/${prNumber}` : `${github_server_url}/${github_repos}`;
+
+    // Fallback to event payload for more reliable PR metadata.
+    try {
+      if (eventPath) {
+        const eventPayload = JSON.parse(fs.readFileSync(eventPath, 'utf8')) as {
+          pull_request?: {
+            number?: number
+            html_url?: string
+          }
+        };
+        if (!prNumber && eventPayload.pull_request?.number) {
+          prNumber = eventPayload.pull_request.number;
+        }
+        if (eventPayload.pull_request?.html_url) {
+          prHtmlUrl = eventPayload.pull_request.html_url;
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to parse GITHUB_EVENT_PATH payload:', error);
+    }
 
     // Parse custom blocks
     let parsedCustomBlocks: (KnownBlock | Block)[] = [];
@@ -101,6 +124,17 @@ async function run(): Promise<void> {
                   },
                   "value": "comment",
                   "action_id": "slack-approval-comment"
+              },
+              {
+                  "type": "button",
+                  "text": {
+                          "type": "plain_text",
+                          "emoji": true,
+                          "text": "Edit PR"
+                  },
+                  "url": `${prHtmlUrl}/edit`,
+                  "value": "edit-pr",
+                  "action_id": "slack-approval-edit-pr"
               },
               {
                   "type": "button",
@@ -211,7 +245,8 @@ async function run(): Promise<void> {
         const metadata = JSON.stringify({
           owner,
           repo,
-          prNumber
+          prNumber,
+          channelId: body.channel?.id
         });
 
         await client.views.open({
@@ -265,14 +300,19 @@ async function run(): Promise<void> {
           owner?: string
           repo?: string
           prNumber?: number
+          channelId?: string
         };
 
         const modalOwner = metadata.owner || owner;
         const modalRepo = metadata.repo || repo;
         const modalPrNumber = metadata.prNumber || prNumber;
+        const modalChannelId = metadata.channelId || channel_id;
 
         if (!modalOwner || !modalRepo || !modalPrNumber) {
           throw new Error("Could not determine the target pull request for the comment.");
+        }
+        if (!modalChannelId) {
+          throw new Error("Could not determine Slack channel for confirmation message.");
         }
 
         const commentText = view.state.values["github-comment-block"]["github-comment-input"].value?.trim();
@@ -289,7 +329,7 @@ async function run(): Promise<void> {
         });
 
         await client.chat.postEphemeral({
-          channel: channel_id,
+          channel: modalChannelId,
           user: body.user.id,
           text: `Posted your comment to PR #${modalPrNumber}.`
         });
